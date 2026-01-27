@@ -1,0 +1,88 @@
+---
+- name: "[DBG] Display current device"
+  ansible.builtin.debug:
+    msg: "Processing device: {{ inventory_hostname }} - {{ device }}"
+
+- name: Retrieve a specific configuration item by name
+  servicenow.itsm.configuration_item_info:
+    name: "{{ inventory_hostname }}"
+  register: cmdb_firewall_details
+  delegate_to: localhost
+
+- name: "[DBG] Display CMDB details"
+  ansible.builtin.debug:
+    msg: "CMDB Record: {{ cmdb_firewall_details }}"
+
+- name: Build list of empty fields
+  ansible.builtin.set_fact:
+    empty_in_ci: >-
+      {{
+        (cmdb_firewall_details.records[0] | default({}, true))
+        | dict2items
+        | selectattr('value', 'in', ['', None, [], {}])
+        | map(attribute='key')
+        | list
+      }}
+
+- name: Select template mode based on CI existence
+  ansible.builtin.set_fact:
+    mode: "{{ 'enforced' if (cmdb_firewall_details.records | length > 0) else 'default' }}"
+  when:
+    - device.mode is not defined
+
+- name: Set template mode if specified
+  ansible.builtin.set_fact:
+    mode: "{{ device.mode }}"
+  when:
+    - device.mode is defined
+
+- name: "[DBG] Display mode"
+  ansible.builtin.debug:
+    var: mode
+
+- name: Choose template based on device type
+  ansible.builtin.set_fact:
+    chosen_template: "{{ templates_by_type[device_type] }}"
+
+- name: Render CMDB device template
+  ansible.builtin.set_fact:
+    device_rendered: "{{ lookup('template', chosen_template) }}"
+
+- name: Convert rendered YAML to dict
+  ansible.builtin.set_fact:
+    device_cmdb: "{{ device_rendered | from_yaml }}"
+
+- name: "[DBG] Display rendered CMDB data"
+  ansible.builtin.debug:
+    var: device_cmdb
+
+- name: Define dynamically vars for CMDB role
+  ansible.builtin.set_fact:
+    update_cmdb_ci_name: "{{ device_cmdb.name | default(omit) }}"
+    update_cmdb_ci_serial_number: "{{ device_cmdb.serial_number | default(omit) }}"
+    update_cmdb_ci_version_full: "{{ device_cmdb.u_firmware_version | default(omit) }}"
+    update_cmdb_ci_hardware_model: "{{ device_cmdb.model_id | default(omit) }}"
+    update_cmdb_ci_firmware_manufacturer: "{{ device_cmdb.firmware_manufacturer | default(omit) }}"
+    update_cmdb_ci_company: "{{ device_cmdb.company | default(omit) }}"
+    update_cmdb_ci_install_status: "{{ device_cmdb.install_status | default(omit) }}"
+    update_cmdb_ci_administrated_by: "{{ device_cmdb.u_administrated_by | default(omit) }}"
+    update_cmdb_ci_support_group: "{{ device_cmdb.support_group | default(omit) }}"
+    update_cmdb_ci_category: "{{ device_cmdb.category | default(omit) }}"
+    update_cmdb_ci_subcategory: "{{ device_cmdb.subcategory | default(omit) }}"
+    update_cmdb_ci_net:
+      ADMINISTRATION:
+        ip_address: "{{ device_cmdb.ip_address | default(omit) }}"
+    update_cmdb_ci_sys_class_name: cmdb_ci_netgear
+    update_cmdb_ci_location: "{{ device_cmdb.location | default(omit) }}"
+    update_cmdb_ci_create: "{{ true if (cmdb_firewall_details.records | length == 0) else omit }}"
+    update_cmdb_ci_environment: "{{ device_cmdb.u_used_for | default(omit) }}"
+
+- name: "[DBG] Check location var"
+  ansible.builtin.debug:
+    msg: "Location: {{ update_cmdb_ci_location }}"
+  when: update_cmdb_ci_location is defined
+
+# - name: Run role
+#   ansible.builtin.include_role:
+#     name: tte.common.update_cmdb_ci
+#   delegate_to: localhost
