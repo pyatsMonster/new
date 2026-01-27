@@ -1,0 +1,42 @@
+---
+- name: Create dynamic inventory from devices_list
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Validate devices_list is defined
+      ansible.builtin.assert:
+        that:
+          - devices_list is defined
+          - devices_list | length > 0
+        fail_msg: "devices_list must be defined and not empty"
+
+    - name: Add devices to cmdb_devices group
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        groups: cmdb_devices
+        device: "{{ item }}"
+        device_type: "{{ item.device_type }}"
+      loop: "{{ devices_list }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Display created hosts
+      ansible.builtin.debug:
+        msg: "Created {{ groups['cmdb_devices'] | length }} hosts in cmdb_devices group"
+
+- name: Firewall Compliance CMDB Updater
+  hosts: cmdb_devices
+  connection: local
+  gather_facts: false
+
+  vars:
+    templates_by_type:
+      f5: "templates/f5_template.yml.j2"
+      f5lb: "templates/f5_lb_template.yml.j2"
+      fortigate: "templates/fortigate_template.yml.j2"
+      paloalto: "templates/paloalto_template.yml.j2"
+
+  roles:
+    - role: templater
