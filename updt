@@ -1,0 +1,37 @@
+flowchart TD
+  A["INPUT: devices_list"] --> B["PLAY 1: Build Dynamic Inventory
+(add_host → cmdb_devices)"]
+
+  B --> C["PLAY 2: For each host in cmdb_devices
+(loop)"]
+
+  C --> D["Retrieve CI from ServiceNow
+Search by inventory_hostname
++ detect empty fields"]
+
+  D --> E{"CI exists?"}
+  E -->|Yes| F["mode = enforced"]
+  E -->|No| G["mode = default"]
+
+  D --> H{"device.mode defined?"}
+  H -->|Yes| I["mode = device.mode"]
+
+  F --> J
+  G --> J
+  I --> J
+
+  J["Select template by device_type
+(f5 / f5lb / fortigate / paloalto)"] --> K["Render Jinja2 template
+• enforced_vars always
+• default_vars by mode
+• manual_template if defined"]
+
+  K --> L["Prepare update_cmdb_ci vars
+(create=true if CI missing)"]
+
+  L --> M["Call tte.common.update_cmdb_ci"]
+
+  M --> N["CI created/updated
+→ next host"]
+
+  N --> C
