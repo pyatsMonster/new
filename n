@@ -6,7 +6,7 @@
               {%- for cfg_result in member_configs.results -%}
                 {%- set member = cfg_result.item -%}
                 {%- set _cfg = cfg_result.content | default('') if ((cfg_result.skipped | default(false)) != true and (cfg_result.status | default(0)) == 200) else '' -%}
-                {%- set _ips = _cfg | regex_findall('set management-ip\\s+(\\S+)') -%}
+                {%- set _ips = _cfg | regex_findall('set management-ip\\s+(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})') | reject('equalto', '0.0.0.0') | list -%}
                 {%- set mgmt_ip = _ips[0] if _ips | length > 0 else fallback_ip -%}
                 {%- set _ = result.append({
                       'name': member.name,
