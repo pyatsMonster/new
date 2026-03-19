@@ -1,0 +1,25 @@
+        - name: Parse management IPs and build cluster device entries
+          vars:
+            fallback_ip: "{{ device_data.ip | default('N/A', true) }}"
+            cluster_devices: >-
+              {%- set result = [] -%}
+              {%- for cfg_result in member_configs.results -%}
+                {%- set member = cfg_result.item -%}
+                {%- set _cfg = cfg_result.content | default('') if ((cfg_result.skipped | default(false)) != true and (cfg_result.status | default(0)) == 200) else '' -%}
+                {%- set _ips = _cfg | regex_findall('set management-ip\\s+(\\S+)') -%}
+                {%- set mgmt_ip = _ips[0] if _ips | length > 0 else fallback_ip -%}
+                {%- set _ = result.append({
+                      'name': member.name,
+                      'device_type': 'fortigate',
+                      'serial': member.sn | default('N/A'),
+                      'version': 'FORTINET FortiOS ' ~ (device_data.version | default(0) | string)[0] ~ '.' ~ (device_data.mr | default(0) | string) ~ '.' ~ (device_data.patch | default(0) | string),
+                      'model': device_data.platform_str | default('N/A'),
+                      'ip': mgmt_ip,
+                      'manufacturer': 'Fortinet',
+                      'cluster_name': device_data.name,
+                      'ha_role': member.role
+                    }) -%}
+              {%- endfor -%}
+              {{ result }}
+          set_fact:
+            devices_list: "{{ cluster_devices }}"
