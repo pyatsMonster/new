@@ -1,0 +1,236 @@
+
+### GET DEVICE INFORMATION FROM FORTIMANAGER
+- name: Get FortiGate detailed information
+  environment:
+    NO_PROXY: "*"
+    no_proxy: "*"
+  uri:
+    url: "https://{{ FORTI_HOST }}/jsonrpc"
+    method: POST
+    validate_certs: no
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ FORTI_TOKEN }}"
+    body_format: json
+    body:
+      id: 3
+      method: "get"
+      params:
+        - url: "/dvmdb/adom/{{ adom | default('root') }}/device/{{ inventory_hostname }}"
+          data:
+            adom: "{{ adom | default('root') }}"
+  register: fortigate
+  delegate_to: localhost
+  ignore_errors: no
+  when: 
+    - FORTI_TOKEN is defined
+
+- name: Show raw API response
+  debug:
+    var: fortigate.json.result[0].data
+  when: fortigate is defined and fortigate.json is defined
+
+### PROCESS DEVICE DATA
+- name: Process FortiGate device data
+  vars:
+    device_data: "{{ fortigate.json.result[0].data }}"
+    ha_slaves: "{{ device_data.ha_slave | default([], true) }}"
+    is_cluster: "{{ ha_slaves is not none and ha_slaves | length > 0 }}"
+  block:
+    ### STANDALONE DEVICE
+    - name: Create device entry (standalone)
+      set_fact:
+        devices_list:
+          - name: "{{ device_data.hostname | default(device_data.name) }}"
+            device_type: "fortigate"
+            serial: "{{ device_data.sn | default('N/A') }}"
+            version: "FORTINET FortiOS {{ (device_data.version | default(0) | string)[0] }}.{{ device_data.mr | default(0) }}.{{ device_data.patch | default(0) }}"
+            model: "{{ device_data.platform_str | default('N/A') }}"
+            ip: "{{ device_data.ip | default('N/A') }}"
+            manufacturer: "Fortinet"
+      when: 
+        - not is_cluster
+        - '"FortiGate" in device_data.platform_str | default("")'
+
+    ### CLUSTER - Resolve individual management IPs via BackBox
+    - name: Resolve cluster member management IPs from BackBox
+      when:
+        - is_cluster
+        - '"FortiGate" in device_data.platform_str | default("")'
+      vars:
+        backbox_api_url: "https://{{ backbox_server | default('10.23.65.75') }}:{{ backbox_port | default(443) }}"
+      block:
+        - name: Build cluster member list from HA data
+          set_fact:
+            cluster_members: >-
+              {%- set result = [] -%}
+              {%- for member in ha_slaves -%}
+              {%-   set _ = result.append({
+                      'name': member.name,
+                      'sn': member.sn | default('N/A'),
+                      'role': 'master' if (member.role | default(0) | int) == 0 else 'slave'
+                    }) -%}
+              {%- endfor -%}
+              {{ result }}
+
+        - name: Debug - Show cluster members to resolve
+          debug:
+            msg: "Cluster {{ device_data.name }} has {{ cluster_members | length }} members: {{ cluster_members | map(attribute='name') | list }}"
+
+        ################################################################
+        # BackBox Authentication
+        ################################################################
+        - name: Authenticate to BackBox server
+          environment:
+            NO_PROXY: "*"
+            no_proxy: "*"
+          uri:
+            url: "{{ backbox_api_url }}/rest/data/token/api/login?username={{ ansible_user | urlencode }}&password={{ ansible_password | urlencode }}"
+            method: GET
+            return_content: true
+            validate_certs: false
+            follow_redirects: all
+            status_code: [200]
+          register: backbox_auth
+          delegate_to: localhost
+
+        - name: Set BackBox authentication credentials
+          set_fact:
+            backbox_auth_token: "{{ backbox_auth.authorization | default(backbox_auth.auth | default(backbox_auth.json.token | default(backbox_auth.json.auth | default(backbox_auth.content | trim)))) }}"
+            backbox_session_cookie: "{{ backbox_auth.cookies_string | default('') }}"
+
+        ################################################################
+        # Get BackBox device list and build name-to-backup mapping
+        ################################################################
+        - name: Get device list from BackBox
+          environment:
+            NO_PROXY: "*"
+            no_proxy: "*"
+          uri:
+            url: "{{ backbox_api_url }}/rest/data/api/devices"
+            method: GET
+            headers:
+              AUTH: "{{ backbox_auth_token }}"
+              Cookie: "{{ backbox_session_cookie }}"
+              Accept: "application/json"
+            return_content: true
+            validate_certs: false
+            follow_redirects: all
+          register: backbox_devices
+          delegate_to: localhost
+
+        - name: Build BackBox device name to ID mapping
+          set_fact:
+            backbox_device_map: >-
+              {%- set result = {} -%}
+              {%- set devices = backbox_devices.json | default([]) -%}
+              {%- if devices is mapping -%}
+                {%- set devices = devices.data | default(devices.devices | default([])) -%}
+              {%- endif -%}
+              {%- if devices is iterable and devices is not string -%}
+                {%- for dev in devices -%}
+                  {%- set dev_name = dev.deviceName | default(dev.name | default('')) -%}
+                  {%- set dev_id = dev.deviceId | default(dev.id | default(0)) -%}
+                  {%- set last_backup = dev.lastBackupId | default(0) -%}
+                  {%- if dev_name -%}
+                    {%- set _ = result.update({dev_name: {'id': dev_id, 'lastBackupId': last_backup}}) -%}
+                  {%- endif -%}
+                {%- endfor -%}
+              {%- endif -%}
+              {{ result }}
+
+        ################################################################
+        # Download config for each cluster member from BackBox
+        ################################################################
+        - name: Download cluster member configurations from BackBox
+          environment:
+            NO_PROXY: "*"
+            no_proxy: "*"
+          uri:
+            url: "{{ backbox_api_url }}/rest/data/download/historyFile/{{ backbox_device_map[item.name].lastBackupId }}/configuration_backup.conf.enc/false/false"
+            method: GET
+            headers:
+              AUTH: "{{ backbox_auth_token }}"
+              Cookie: "{{ backbox_session_cookie }}"
+              Accept: "*/*"
+            return_content: true
+            validate_certs: false
+            follow_redirects: all
+            status_code: [200, 404]
+          register: member_configs
+          loop: "{{ cluster_members }}"
+          loop_control:
+            label: "Member {{ item.name }}"
+          when: item.name in backbox_device_map and (backbox_device_map[item.name].lastBackupId | default(0) | int) > 0
+          delegate_to: localhost
+          ignore_errors: true
+
+        ################################################################
+        # Parse management-ip from each config and build device entries
+        ################################################################
+        - name: Parse management IPs and build cluster device entries
+          vars:
+            cluster_devices: >-
+              {%- set result = [] -%}
+              {%- for cfg_result in member_configs.results -%}
+                {%- set member = cfg_result.item -%}
+                {%- set mgmt_ip = device_data.ip | default('N/A') -%}
+                {%- if cfg_result.skipped is not defined or not cfg_result.skipped -%}
+                  {%- if cfg_result.status is defined and cfg_result.status == 200 -%}
+                    {%- set config_lines = cfg_result.content | default('') | regex_findall('set management-ip\\s+(\\S+)') -%}
+                    {%- if config_lines | length > 0 -%}
+                      {%- set mgmt_ip = config_lines[0] -%}
+                    {%- endif -%}
+                  {%- endif -%}
+                {%- endif -%}
+                {%- set _ = result.append({
+                      'name': member.name,
+                      'device_type': 'fortigate',
+                      'serial': member.sn | default('N/A'),
+                      'version': 'FORTINET FortiOS ' ~ (device_data.version | default(0) | string)[0] ~ '.' ~ (device_data.mr | default(0) | string) ~ '.' ~ (device_data.patch | default(0) | string),
+                      'model': device_data.platform_str | default('N/A'),
+                      'ip': mgmt_ip,
+                      'manufacturer': 'Fortinet',
+                      'cluster_name': device_data.name,
+                      'ha_role': member.role
+                    }) -%}
+              {%- endfor -%}
+              {{ result }}
+          set_fact:
+            devices_list: "{{ cluster_devices }}"
+
+        - name: Report cluster members not found in BackBox
+          debug:
+            msg: "WARNING: {{ item.name }} not found in BackBox or has no backup - using cluster IP ({{ device_data.ip | default('N/A') }}) as fallback"
+          loop: "{{ cluster_members }}"
+          loop_control:
+            label: "{{ item.name }}"
+          when: item.name not in backbox_device_map or (backbox_device_map[item.name].lastBackupId | default(0) | int) == 0
+
+        ################################################################
+        # BackBox Logout
+        ################################################################
+        - name: Logout from BackBox server
+          environment:
+            NO_PROXY: "*"
+            no_proxy: "*"
+          uri:
+            url: "{{ backbox_api_url }}/rest/data/token/api/logout"
+            method: GET
+            headers:
+              AUTH: "{{ backbox_auth_token }}"
+              Cookie: "{{ backbox_session_cookie }}"
+            validate_certs: false
+            status_code: [200, 302, 204, 401]
+          delegate_to: localhost
+          ignore_errors: true
+
+  when: 
+    - fortigate is defined 
+    - fortigate.json is defined 
+    - fortigate.json.result[0].data is defined
+
+- name: Show processed devices
+  debug:
+    var: devices_list
+  when: devices_list is defined
