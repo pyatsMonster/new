@@ -1,0 +1,84 @@
+- name: Get ADOM list from FortiManager
+  environment:
+    NO_PROXY: "*"
+    no_proxy: "*"
+  uri:
+    url: "https://{{ FORTI_HOST }}/jsonrpc"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ FORTI_TOKEN }}"
+    body_format: json
+    body:
+      id: 10
+      jsonrpc: "1.0"
+      method: get
+      params:
+        - url: "/dvmdb/adom"
+    return_content: true
+    validate_certs: false
+  register: fmg_adoms_rsp
+
+- name: Set discovered ADOM list
+  set_fact:
+    adom_list: >-
+      {{
+        fmg_adoms_rsp.json.result[0].data
+        | map(attribute='name')
+        | list
+      }}
+
+- name: Fetch device lists for each ADOM
+  environment:
+    NO_PROXY: "*"
+    no_proxy: "*"
+  uri:
+    url: "https://{{ FORTI_HOST }}/jsonrpc"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ FORTI_TOKEN }}"
+    body_format: json
+    body:
+      id: 11
+      jsonrpc: "1.0"
+      method: get
+      params:
+        - url: "/dvmdb/adom/{{ item }}/device"
+    return_content: true
+    validate_certs: false
+  loop: "{{ adom_list }}"
+  loop_control:
+    label: "ADOM {{ item }}"
+  register: adom_devices_data
+
+- name: Initialize device to ADOM mapping
+  set_fact:
+    device_adom_map: {}
+
+- name: Build device to ADOM mapping
+  vars:
+    device_names: >-
+      {{ (adom_devices_data.results[idx].json.result[0].data | default([]))
+         | map(attribute='name') | list }}
+    adom_values: "{{ [adom_list[idx]] * (device_names | length) }}"
+  set_fact:
+    device_adom_map: "{{ device_adom_map | combine(dict(device_names | zip(adom_values))) }}"
+  loop: "{{ range(adom_list | length) | list }}"
+  loop_control:
+    loop_var: idx
+    label: "ADOM {{ adom_list[idx] }}"
+
+- name: Verify all devices were found in an ADOM
+  fail:
+    msg: "Device '{{ item }}' was not found in any ADOM on FortiManager {{ FORTI_HOST }}"
+  loop: "{{ groups['devices'] }}"
+  when: item not in device_adom_map
+
+- name: Assign ADOM to each device
+  add_host:
+    name: "{{ item }}"
+    adom: "{{ device_adom_map[item] }}"
+  loop: "{{ groups['devices'] }}"
+  loop_control:
+    label: "{{ item }} -> {{ device_adom_map[item] }}"
