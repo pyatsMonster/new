@@ -1,0 +1,24 @@
+
+    - name: Send e-mail to send the mail with local account details
+      mail:
+        host: "emeamaicli-el01.main.glb.corp.local"
+        port: 25
+        subject: "Compliance job result Xlsx"
+        body: |
+          Successfuly upgraded devices :
+          {{ successful_upgrades | default([]) | join('\n') if (successful_upgrades | default([]) | length > 0) else 'None' }}
+
+          Failed devices :
+          {{ failed_upgrades | default([]) | join('\n') if (failed_upgrades | default([]) | length > 0) else 'None' }}
+        from: "ansible@mail01.totalenergies.com"
+        to:
+          - "nassim.hadji@external.totalenergies.com"
+        # cc:
+        #   - "{{ send_cc }}"
+        attach:
+          - "/runner/project/playbooks/compliance_report.xlsx"
+          # - "/tmp/{{ tower_job_id }}_win_unreachable_hosts.csv"
+        charset: us-ascii
+      register: sedmmail1
+      delegate_to: localhost
+      run_once: true
