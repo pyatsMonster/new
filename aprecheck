@@ -1,0 +1,270 @@
+# - name: Get detailed FortiGate information
+#   environment:
+#     NO_PROXY: "*"
+#     no_proxy: "*"
+#   vars:
+#     xxFORTI_HOST: "10.23.148.200"
+#     xxFORTI_TOKEN: "uzanwpbz8tqpmgd8gcr41ftc9qi6jwg9"
+#     xxadom: "ADM-ZAC-ADOM-LAB"
+#   uri:
+#     url: "https://{{ xxFORTI_HOST }}/jsonrpc"
+#     method: POST
+#     validate_certs: false
+#     headers:
+#       Content-Type: "application/json"
+#       Authorization: "Bearer {{ xxFORTI_TOKEN }}"
+#     body_format: json
+#     body:
+#       id: 1
+#       method: "get"
+#       params:
+#         - url: "/dvmdb/adom/{{ xxadom }}/device/{{ inventory_hostname }}"
+#           data:
+#             adom: "{{ xxadom }}"
+#     return_content: true
+#     use_proxy: false
+#   register: fortigate_details
+
+- name: Get detailed FortiGate information
+  environment:
+    NO_PROXY: "*"
+    no_proxy: "*"
+  uri:
+    url: "https://{{ FORTI_HOST }}/jsonrpc"
+    method: POST
+    validate_certs: false
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ FORTI_TOKEN }}"
+    body_format: json
+    body:
+      id: 1
+      method: "get"
+      params:
+        - url: "/dvmdb/adom/{{ adom }}/device/{{ inventory_hostname }}"
+          data:
+            adom: "{{ adom }}"
+    return_content: true
+    use_proxy: false
+  register: fortigate_details
+
+- name: Initialize precheck assert tracking
+  set_fact:
+    precheck_assert_messages: []
+
+- name: Store FortiGate information
+  set_fact:
+    fortigate_info:
+      hostname: "{{ fortigate_details.json.result[0].data.hostname | default('N/A') }}"
+      serial_number: "{{ fortigate_details.json.result[0].data.sn | default('N/A') }}"
+      current_version: "{{ (fortigate_details.json.result[0].data.version | string)[0] }}.{{ fortigate_details.json.result[0].data.mr | string }}.{{ fortigate_details.json.result[0].data.patch | string }}"
+      ip_address: "{{ fortigate_details.json.result[0].data.ip | default(FGT_HOST) }}"
+      platform: "{{ fortigate_details.json.result[0].data.platform_str | default('N/A') }}"
+      ha_mode: "{{ fortigate_details.json.result[0].data.ha_mode | default('standalone') }}"
+      vdoms: "{{ fortigate_details.json.result[0].data.vdom | map(attribute='name') | list }}"
+
+  when: 
+    - fortigate_details is defined 
+    - fortigate_details.json is defined 
+    - fortigate_details.json.result[0].data is defined
+
+# # Comment this for testing (pour pouvoir upgrade et downgrade)
+
+# - name: Check device version
+#   ansible.builtin.assert:
+#     that:
+#       - "{{ fortigate_info.current_version is version(upgrade_version, '<') }}"
+#     success_msg: "Device {{ inventory_hostname }} needs to be upgraded to {{ upgrade_version }}"
+#     fail_msg: "Device {{ inventory_hostname }} does not need to be upgraded"
+#   register: check_version
+#   when: upgrade_version is defined
+
+
+- name: Execute system performance status via FortiGate proxy
+  environment:
+    NO_PROXY: "*"
+    no_proxy: "*"
+  uri:
+    url: "https://{{ FORTI_HOST }}/jsonrpc"
+    method: POST
+    validate_certs: false
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ FORTI_TOKEN }}"
+    body_format: json
+    body:
+      method: "exec"
+      params:
+        - data:
+            action: "get"
+            resource: "/api/v2/monitor/system/performance/status?global=1"
+            target: ["device/{{ inventory_hostname }}"]
+            timeout: 60
+          url: "/sys/proxy/json"
+      id: 1
+    return_content: yes
+  register: sys_perf_response
+
+- name: Show FortiGate performance response
+  debug:
+    var: sys_perf_response.json
+
+- name: set CPU & Mem Usage
+  set_fact:
+    fortigate_perf:
+      cpu_usage: "{{ 100 - (sys_perf_response.json.result[0].data[0].response.results.cpu.idle | int)  }}"
+      mem_usage: "{{ (sys_perf_response.json.result[0].data[0].response.results.mem.used * 100) // sys_perf_response.json.result[0].data[0].response.results.mem.total }}"
+
+- name: Check Fortigate CPU usage
+  assert:
+    that:
+      - "{{ fortigate_perf.cpu_usage | int < 80 }}"
+    success_msg: "CPU usage normal: {{ fortigate_perf.cpu_usage }}%"
+    fail_msg: "CPU usage high: {{ fortigate_perf.cpu_usage }}%"
+  register: precheck_cpu_assert
+  ignore_errors: true
+
+- name: Record precheck CPU assert result
+  set_fact:
+    precheck_assert_messages: >-
+      {{ (precheck_assert_messages | default([])) +
+         [((precheck_cpu_assert.failed | default(false)) | ternary('FAIL', 'OK')) ~ ': ' ~ (precheck_cpu_assert.msg | default('CPU assert executed'))] }}
+
+- name: Stop precheck on first failed assert (CPU)
+  fail:
+    msg: "{{ precheck_cpu_assert.msg | default('Precheck CPU assert failed') }}"
+  when: precheck_cpu_assert.failed | default(false)
+
+- name: Check Fortigate Mem usage
+  assert:
+    that:
+      - "{{ fortigate_perf.mem_usage| int < 80 }}"
+    success_msg: "Mem usage normal: {{ fortigate_perf.mem_usage }}%"
+    fail_msg: "Mem usage high: {{ fortigate_perf.mem_usage }}%"
+  register: precheck_mem_assert
+  ignore_errors: true
+
+- name: Record precheck Mem assert result
+  set_fact:
+    precheck_assert_messages: >-
+      {{ (precheck_assert_messages | default([])) +
+         [((precheck_mem_assert.failed | default(false)) | ternary('FAIL', 'OK')) ~ ': ' ~ (precheck_mem_assert.msg | default('Memory assert executed'))] }}
+
+- name: Stop precheck on first failed assert (Mem)
+  fail:
+    msg: "{{ precheck_mem_assert.msg | default('Precheck memory assert failed') }}"
+  when: precheck_mem_assert.failed | default(false)
+
+- name: Get web-ui sys state via FortiGate proxy
+  environment:
+    NO_PROXY: "*"
+    no_proxy: "*"
+  uri:
+    url: "https://{{ FORTI_HOST }}/jsonrpc"
+    method: POST
+    validate_certs: false
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ FORTI_TOKEN }}"
+    body_format: json
+    body:
+      method: "exec"
+      params:
+        - data:
+            action: "get"
+            resource: "/api/v2/monitor/web-ui/state?global=1"
+            target: ["device/{{ inventory_hostname }}"]
+            timeout: 60
+          url: "/sys/proxy/json"
+      id: 1
+    return_content: yes
+  register: sys_status_response
+
+- name: Show FortiGate web-ui state (sys status)
+  debug:
+    var: sys_status_response.json
+
+- name: Calculate uptime in seconds
+  set_fact:
+    uptime_seconds: "{{ ( sys_status_response.json.result[0].data[0].response.results.snapshot_utc_time | int - sys_status_response.json.result[0].data[0].response.results.utc_last_reboot | int) // 1000 }}"
+
+- name: Convert uptime to days/hours/minutes/seconds
+  set_fact:
+    uptime_days: "{{ uptime_seconds | int // 86400 }}"
+    uptime_hours: "{{ (uptime_seconds | int % 86400) // 3600 }}"
+    uptime_minutes: "{{ (uptime_seconds | int % 3600) // 60 }}"
+    uptime_secs: "{{ uptime_seconds | int % 60 }}"
+
+- name: Print uptime
+  debug:
+    msg: >
+      Uptime is {{ uptime_days }} days,
+      {{ uptime_hours }} hours,
+      {{ uptime_minutes }} minutes,
+      {{ uptime_secs }} seconds.
+
+#TODO: assert for uptime maybe
+
+- name: Get full IPv4 routing table via FMG proxy
+  environment:
+    NO_PROXY: "*"
+    no_proxy: "*"
+  uri:
+    url: "https://{{ FORTI_HOST }}/jsonrpc"
+    method: POST
+    validate_certs: false
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ FORTI_TOKEN }}"
+    body_format: json
+    body:
+      method: "exec"
+      params:
+        - data:
+            action: "get"
+            resource: "/api/v2/monitor/router/ipv4"
+            target: ["device/{{ inventory_hostname }}"]
+            timeout: 60
+          url: "/sys/proxy/json"
+      id: 1
+    return_content: yes
+  register: routes_ipv4
+
+- name: Show a few route fields
+  debug:
+    var: routes_ipv4.json.result[0].data[0].response.results
+
+
+- name: Get IPsec tunnels via FMG proxy
+  environment:
+    NO_PROXY: "*"
+    no_proxy: "*"
+  uri:
+    url: "https://{{ FORTI_HOST }}/jsonrpc"
+    method: POST
+    validate_certs: false
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ FORTI_TOKEN }}"
+    body_format: json
+    body:
+      method: "exec"
+      params:
+        - data:
+            action: "get"
+            resource: "/api/v2/monitor/vpn/ipsec"
+            target: ["device/{{ inventory_hostname }}"]
+            timeout: 60
+          url: "/sys/proxy/json"
+      id: 2
+    return_content: yes
+  register: ipsec_tunnels
+
+- name: View tunnels
+  debug:
+    var: ipsec_tunnels.json.result[0].data[0].response.results
+
+- name: Store pre-upgrade routes and tunnels lists
+  set_fact:
+    routes_before_list: "{{ routes_ipv4.json.result[0].data[0].response.results | default([]) }}"
+    tunnels_before_list: "{{ ipsec_tunnels.json.result[0].data[0].response.results | default([]) }}"
