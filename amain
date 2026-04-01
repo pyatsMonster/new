@@ -1,0 +1,117 @@
+- name: Inventory
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Fill inventory
+      include_tasks: tasks/fill_inventory.yml
+      run_once: true
+
+    - name: Discover ADOM for each device
+      include_tasks: tasks/discover_adom.yml
+      run_once: true
+
+    - name: Initialize upgrade tracking lists
+      set_fact:
+        successful_upgrades: []
+        failed_upgrades: []
+
+- name: Firewall Upgrader
+  hosts: devices
+  gather_facts: no
+  tasks:
+
+    - name: Run Prechecks
+      include_tasks: tasks/precheck.yml
+    - name: Run Upgrades
+      include_tasks: tasks/upgrade.yml
+    - name: Run Postchecks
+      include_tasks: tasks/postcheck.yml
+
+    # - name: show hosts
+    #   debug:
+    #     msg: >
+    #       {{ groups['devices']
+    #       | map('extract', hostvars, 'group_names')
+    #       | flatten
+    #       | unique
+    #       | difference(['devices'])
+    #       }}
+
+- name: Upgrade Summary
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Build effective failed devices list
+      set_fact:
+        effective_failed_upgrades: "{{ (groups['devices'] | default([])) | difference(successful_upgrades | default([])) }}"
+
+    - name: Display upgrade results
+      debug:
+        msg:
+          successful_upgrades: "{{ successful_upgrades }}"
+          failed_upgrades: "{{ effective_failed_upgrades }}"
+          total_success: "{{ successful_upgrades | length }}"
+          total_failed: "{{ effective_failed_upgrades | length }}"
+
+    - name: Send e-mail to send the mail with local account details
+      mail:
+        host: "emeamaicli-el01.main.glb.corp.local"
+        port: 25
+        subject: "Compliance job result Xlsx"
+        body: |
+          Successfuly upgraded devices :
+          {% if successful_upgrades | default([]) | length > 0 %}
+          {% for device in successful_upgrades | default([]) %}
+          - {{ device }}
+            Prechecks:
+          {% for msg in (hostvars[device].precheck_assert_messages | default([])) %}
+              - {{ msg }}
+          {% else %}
+              - No precheck assert data
+          {% endfor %}
+            Postchecks:
+          {% for msg in (hostvars[device].postcheck_assert_messages | default([])) %}
+              - {{ msg }}
+          {% else %}
+              - No postcheck assert data
+          {% endfor %}
+          {% endfor %}
+          {% else %}
+          None
+          {% endif %}
+
+          Failed devices :
+          {% if effective_failed_upgrades | default([]) | length > 0 %}
+          {% for device in effective_failed_upgrades | default([]) %}
+          - {{ device }}
+            Prechecks (until failure):
+          {% for msg in (hostvars[device].precheck_assert_messages | default([])) %}
+              - {{ msg }}
+          {% else %}
+              - No precheck assert data
+          {% endfor %}
+            Postchecks (until failure):
+          {% for msg in (hostvars[device].postcheck_assert_messages | default([])) %}
+              - {{ msg }}
+          {% else %}
+              - No postcheck assert data
+          {% endfor %}
+          {% set all_assert_msgs = (hostvars[device].precheck_assert_messages | default([])) + (hostvars[device].postcheck_assert_messages | default([])) %}
+            First failed assert:
+              - {{ (all_assert_msgs | select('match', '^FAIL:') | list | first) | default('No assert failure message captured') }}
+          {% endfor %}
+          {% else %}
+          None
+          {% endif %}
+        from: "ansible@mail01.totalenergies.com"
+        to:
+          - "nassim.hadji@external.totalenergies.com"
+        # cc:
+        #   - "{{ send_cc }}"
+        attach:
+          - "/runner/project/playbooks/compliance_report.xlsx"
+          # - "/tmp/{{ tower_job_id }}_win_unreachable_hosts.csv"
+        charset: us-ascii
+      register: sedmmail1
+      delegate_to: localhost
+      run_once: true
