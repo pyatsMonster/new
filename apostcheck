@@ -1,0 +1,310 @@
+# ──────────────────────────────────────────────────────────────
+# Postcheck — run after upgrade to verify device state
+# routes_before_list and tunnels_before_list are set by the precheck phase
+# ──────────────────────────────────────────────────────────────
+
+- name: Get detailed FortiGate information (post-upgrade)
+  environment:
+    NO_PROXY: "*"
+    no_proxy: "*"
+  uri:
+    url: "https://{{ FORTI_HOST }}/jsonrpc"
+    method: POST
+    validate_certs: false
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ FORTI_TOKEN }}"
+    body_format: json
+    body:
+      id: 1
+      method: "get"
+      params:
+        - url: "/dvmdb/adom/{{ adom }}/device/{{ inventory_hostname }}"
+          data:
+            adom: "{{ adom }}"
+    return_content: true
+    use_proxy: false
+  register: fortigate_details_post
+
+- name: Initialize postcheck assert tracking
+  set_fact:
+    postcheck_assert_messages: []
+
+- name: Store post-upgrade FortiGate info
+  set_fact:
+    fortigate_info_post:
+      hostname: "{{ fortigate_details_post.json.result[0].data.hostname | default('N/A') }}"
+      serial_number: "{{ fortigate_details_post.json.result[0].data.sn | default('N/A') }}"
+      current_version: "{{ (fortigate_details_post.json.result[0].data.version | string)[0] }}.{{ fortigate_details_post.json.result[0].data.mr | string }}.{{ fortigate_details_post.json.result[0].data.patch | string }}"
+      ip_address: "{{ fortigate_details_post.json.result[0].data.ip | default(FGT_HOST) }}"
+      platform: "{{ fortigate_details_post.json.result[0].data.platform_str | default('N/A') }}"
+  when:
+    - fortigate_details_post is defined
+    - fortigate_details_post.json is defined
+    - fortigate_details_post.json.result[0].data is defined
+
+- name: Display post-upgrade version
+  debug:
+    msg: "Device {{ inventory_hostname }} — version after upgrade: {{ fortigate_info_post.current_version }}"
+
+- name: Verify device upgraded to target version
+  assert:
+    that:
+      - fortigate_info_post.current_version == upgrade_version
+    success_msg: "Version matches target: {{ fortigate_info_post.current_version }}"
+    fail_msg: "Version mismatch — expected {{ upgrade_version }}, got {{ fortigate_info_post.current_version }}"
+  register: postcheck_version_assert
+  ignore_errors: true
+  when: upgrade_version is defined
+
+- name: Record postcheck version assert result
+  set_fact:
+    postcheck_assert_messages: >-
+      {{ (postcheck_assert_messages | default([])) +
+         [((postcheck_version_assert.failed | default(false)) | ternary('FAIL', 'OK')) ~ ': ' ~ (postcheck_version_assert.msg | default('Version assert executed'))] }}
+  when: upgrade_version is defined
+
+- name: Stop postcheck on first failed assert (version)
+  fail:
+    msg: "{{ postcheck_version_assert.msg | default('Postcheck version assert failed') }}"
+  when:
+    - upgrade_version is defined
+    - postcheck_version_assert.failed | default(false)
+
+# ──────────────────────────────────────────────────────────────
+# Performance check post-upgrade
+# ──────────────────────────────────────────────────────────────
+
+- name: Execute system performance status (post-upgrade)
+  environment:
+    NO_PROXY: "*"
+    no_proxy: "*"
+  uri:
+    url: "https://{{ FORTI_HOST }}/jsonrpc"
+    method: POST
+    validate_certs: false
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ FORTI_TOKEN }}"
+    body_format: json
+    body:
+      method: "exec"
+      params:
+        - data:
+            action: "get"
+            resource: "/api/v2/monitor/system/performance/status?global=1"
+            target: ["device/{{ inventory_hostname }}"]
+            timeout: 60
+          url: "/sys/proxy/json"
+      id: 1
+    return_content: yes
+  register: sys_perf_response_post
+
+- name: Set post-upgrade CPU & Mem Usage
+  set_fact:
+    fortigate_perf_post:
+      cpu_usage: "{{ 100 - (sys_perf_response_post.json.result[0].data[0].response.results.cpu.idle | int) }}"
+      mem_usage: "{{ (sys_perf_response_post.json.result[0].data[0].response.results.mem.used * 100) // sys_perf_response_post.json.result[0].data[0].response.results.mem.total }}"
+
+- name: Display post-upgrade performance
+  debug:
+    msg:
+      cpu_usage: "{{ fortigate_perf_post.cpu_usage }}%"
+      mem_usage: "{{ fortigate_perf_post.mem_usage }}%"
+
+- name: Check post-upgrade CPU usage
+  assert:
+    that:
+      - "{{ fortigate_perf_post.cpu_usage | int < 80 }}"
+    success_msg: "Post-upgrade CPU usage normal: {{ fortigate_perf_post.cpu_usage }}%"
+    fail_msg: "Post-upgrade CPU usage high: {{ fortigate_perf_post.cpu_usage }}%"
+  register: postcheck_cpu_assert
+  ignore_errors: true
+
+- name: Record postcheck CPU assert result
+  set_fact:
+    postcheck_assert_messages: >-
+      {{ (postcheck_assert_messages | default([])) +
+         [((postcheck_cpu_assert.failed | default(false)) | ternary('FAIL', 'OK')) ~ ': ' ~ (postcheck_cpu_assert.msg | default('Post-upgrade CPU assert executed'))] }}
+
+- name: Stop postcheck on first failed assert (CPU)
+  fail:
+    msg: "{{ postcheck_cpu_assert.msg | default('Postcheck CPU assert failed') }}"
+  when: postcheck_cpu_assert.failed | default(false)
+
+- name: Check post-upgrade Mem usage
+  assert:
+    that:
+      - "{{ fortigate_perf_post.mem_usage | int < 80 }}"
+    success_msg: "Post-upgrade Mem usage normal: {{ fortigate_perf_post.mem_usage }}%"
+    fail_msg: "Post-upgrade Mem usage high: {{ fortigate_perf_post.mem_usage }}%"
+  register: postcheck_mem_assert
+  ignore_errors: true
+
+- name: Record postcheck Mem assert result
+  set_fact:
+    postcheck_assert_messages: >-
+      {{ (postcheck_assert_messages | default([])) +
+         [((postcheck_mem_assert.failed | default(false)) | ternary('FAIL', 'OK')) ~ ': ' ~ (postcheck_mem_assert.msg | default('Post-upgrade memory assert executed'))] }}
+
+- name: Stop postcheck on first failed assert (Mem)
+  fail:
+    msg: "{{ postcheck_mem_assert.msg | default('Postcheck memory assert failed') }}"
+  when: postcheck_mem_assert.failed | default(false)
+
+# ──────────────────────────────────────────────────────────────
+# Re-fetch routes and tunnels for comparison with pre-upgrade
+# ──────────────────────────────────────────────────────────────
+
+- name: Get full IPv4 routing table via FMG proxy (post-upgrade)
+  environment:
+    NO_PROXY: "*"
+    no_proxy: "*"
+  uri:
+    url: "https://{{ FORTI_HOST }}/jsonrpc"
+    method: POST
+    validate_certs: false
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ FORTI_TOKEN }}"
+    body_format: json
+    body:
+      method: "exec"
+      params:
+        - data:
+            action: "get"
+            resource: "/api/v2/monitor/router/ipv4"
+            target: ["device/{{ inventory_hostname }}"]
+            timeout: 60
+          url: "/sys/proxy/json"
+      id: 1
+    return_content: yes
+  register: routes_ipv4_post
+
+- name: Show post-upgrade routes
+  debug:
+    var: routes_ipv4_post.json.result[0].data[0].response.results
+
+- name: Get IPsec tunnels via FMG proxy (post-upgrade)
+  environment:
+    NO_PROXY: "*"
+    no_proxy: "*"
+  uri:
+    url: "https://{{ FORTI_HOST }}/jsonrpc"
+    method: POST
+    validate_certs: false
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ FORTI_TOKEN }}"
+    body_format: json
+    body:
+      method: "exec"
+      params:
+        - data:
+            action: "get"
+            resource: "/api/v2/monitor/vpn/ipsec"
+            target: ["device/{{ inventory_hostname }}"]
+            timeout: 60
+          url: "/sys/proxy/json"
+      id: 2
+    return_content: yes
+  register: ipsec_tunnels_post
+
+- name: Show post-upgrade tunnels
+  debug:
+    var: ipsec_tunnels_post.json.result[0].data[0].response.results
+
+- name: Store post-upgrade routes and tunnels lists
+  set_fact:
+    routes_after_list: "{{ routes_ipv4_post.json.result[0].data[0].response.results | default([]) }}"
+    tunnels_after_list: "{{ ipsec_tunnels_post.json.result[0].data[0].response.results | default([]) }}"
+
+# ──────────────────────────────────────────────────────────────
+# Compare pre vs post upgrade routes and tunnels
+# ──────────────────────────────────────────────────────────────
+
+- name: Build route signatures (before)
+  set_fact:
+    routes_before_sig: "{{ (routes_before_sig | default([])) + [ item | to_json ] }}"
+  loop: "{{ routes_before_list }}"
+
+- name: Build route signatures (after)
+  set_fact:
+    routes_after_sig: "{{ (routes_after_sig | default([])) + [ item | to_json ] }}"
+  loop: "{{ routes_after_list }}"
+
+- name: Build tunnel name lists
+  set_fact:
+    tunnel_names_before: "{{ tunnels_before_list | map(attribute='name') | list }}"
+    tunnel_names_after: "{{ tunnels_after_list | map(attribute='name') | list }}"
+
+- name: Compute routes/tunnels differences
+  set_fact:
+    routes_missing_in_after_sig: "{{ routes_before_sig | default([]) | difference(routes_after_sig | default([])) }}"
+    routes_new_in_after_sig:     "{{ routes_after_sig  | default([]) | difference(routes_before_sig | default([])) }}"
+    tunnels_missing_after_upgrade: "{{ tunnel_names_before | difference(tunnel_names_after) }}"
+    tunnels_new_after_upgrade:     "{{ tunnel_names_after  | difference(tunnel_names_before) }}"
+
+- name: Convert route diff signatures back to dicts
+  set_fact:
+    routes_missing_in_after: "{{ routes_missing_in_after_sig | default([]) | map('from_json') | list }}"
+    routes_new_in_after:     "{{ routes_new_in_after_sig     | default([]) | map('from_json') | list }}"
+
+- name: Determine if routes/tunnels are identical
+  set_fact:
+    routes_identical: >-
+      {{ (routes_missing_in_after | length == 0)
+         and (routes_new_in_after | length == 0) }}
+    tunnels_identical: >-
+      {{ (tunnels_missing_after_upgrade | length == 0)
+         and (tunnels_new_after_upgrade | length == 0) }}
+
+- name: Show comparison results
+  debug:
+    msg:
+      routes_identical: "{{ routes_identical }}"
+      routes_missing_after_upgrade: "{{ routes_missing_in_after }}"
+      routes_new_after_upgrade: "{{ routes_new_in_after }}"
+      tunnels_identical: "{{ tunnels_identical }}"
+      tunnels_missing_after_upgrade: "{{ tunnels_missing_after_upgrade }}"
+      tunnels_new_after_upgrade: "{{ tunnels_new_after_upgrade }}"
+
+- name: Assert routes are unchanged after upgrade
+  assert:
+    that:
+      - routes_identical | bool
+    success_msg: "All routes are identical before and after upgrade"
+    fail_msg: "Routes differ after upgrade — missing: {{ routes_missing_in_after | length }}, new: {{ routes_new_in_after | length }}"
+  register: postcheck_routes_assert
+  ignore_errors: true
+
+- name: Record postcheck routes assert result
+  set_fact:
+    postcheck_assert_messages: >-
+      {{ (postcheck_assert_messages | default([])) +
+         [((postcheck_routes_assert.failed | default(false)) | ternary('FAIL', 'OK')) ~ ': ' ~ (postcheck_routes_assert.msg | default('Routes assert executed'))] }}
+
+- name: Stop postcheck on first failed assert (routes)
+  fail:
+    msg: "{{ postcheck_routes_assert.msg | default('Postcheck routes assert failed') }}"
+  when: postcheck_routes_assert.failed | default(false)
+
+- name: Assert tunnels are unchanged after upgrade
+  assert:
+    that:
+      - tunnels_identical | bool
+    success_msg: "All IPsec tunnels are identical before and after upgrade"
+    fail_msg: "Tunnels differ after upgrade — missing: {{ tunnels_missing_after_upgrade }}, new: {{ tunnels_new_after_upgrade }}"
+  register: postcheck_tunnels_assert
+  ignore_errors: true
+
+- name: Record postcheck tunnels assert result
+  set_fact:
+    postcheck_assert_messages: >-
+      {{ (postcheck_assert_messages | default([])) +
+         [((postcheck_tunnels_assert.failed | default(false)) | ternary('FAIL', 'OK')) ~ ': ' ~ (postcheck_tunnels_assert.msg | default('Tunnels assert executed'))] }}
+
+- name: Stop postcheck on first failed assert (tunnels)
+  fail:
+    msg: "{{ postcheck_tunnels_assert.msg | default('Postcheck tunnels assert failed') }}"
+  when: postcheck_tunnels_assert.failed | default(false)
